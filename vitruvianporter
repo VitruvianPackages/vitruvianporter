@@ -19,7 +19,7 @@ SUITES = {
 	"testing": "testing",
 	"testing-nightly": "testing",
 }
-PORT_KEYS = {"git", "commit", "debian", "version"}
+PORT_KEYS = {"git", "commit", "subdir", "debian", "version"}
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME",
 	os.path.expanduser("~/.cache")), "vitruvianporter")
 
@@ -181,6 +181,9 @@ def check_port(port):
 			errors.append("git: not an https URL: " + f["git"])
 		if not re.fullmatch(r"[0-9a-f]{40}", f["commit"]):
 			errors.append("commit: not a full sha")
+		if "subdir" in f and not re.fullmatch(r"[\w.-]+(/[\w.-]+)*", f["subdir"]) \
+				or ".." in f.get("subdir", ""):
+			errors.append("subdir: not a relative path")
 	needed = ("control", "changelog", "rules", "copyright", "source/format")
 	if port.kind == "debian":
 		needed = ("changelog",)
@@ -230,6 +233,7 @@ RUN apt-get update \\
  && if ls /opt/extra/*.deb >/dev/null 2>&1; then apt-get install -y /opt/extra/*.deb; fi \\
  && apt-get install -y vos-dev dh-vos \\
  && apt-get clean
+ENV PATH=/usr/lib/vos/buildtools:$PATH
 """
 
 
@@ -260,10 +264,13 @@ def fetch_git(port, work):
 	if not have:
 		run(["git", "-C", mirror, "fetch", "-q", "--depth", "1", url, commit])
 	prefix = "%s-%s" % (port.source, port.upstream)
+	tree = commit
+	if "subdir" in port.fields:
+		tree += ":" + port.fields["subdir"]
 	orig = os.path.join(work, "%s_%s.orig.tar.gz" % (port.source, port.upstream))
 	with open(orig, "wb") as out:
 		archive = subprocess.Popen(["git", "-C", mirror, "archive",
-			"--prefix=" + prefix + "/", commit], stdout=subprocess.PIPE)
+			"--prefix=" + prefix + "/", tree], stdout=subprocess.PIPE)
 		subprocess.run(["gzip", "-n"], stdin=archive.stdout, stdout=out, check=True)
 		if archive.wait() != 0:
 			die("%s: git archive failed" % port.name)
