@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+# Copyright 2026, Dario Casalinuovo. All rights reserved.
+"""Builds V\\OS port packages in a clean V\\OS build root."""
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = "https://repo.v-os.dev"
+REPO_KEY = REPO + "/repo-key.asc"
+SUITES = {
+	"trixie": "trixie",
+	"trixie-nightly": "trixie",
+	"testing": "testing",
+	"testing-nightly": "testing",
+}
+PORT_KEYS = {"git", "commit", "debian", "version"}
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME",
+	os.path.expanduser("~/.cache")), "vitruvianporter")
+
+
+def die(msg):
+	print("vitruvianporter: " + msg, file=sys.stderr)
+	sys.exit(1)
+
+
+def run(cmd, **kw):
+	print("+ " + " ".join(cmd), file=sys.stderr)
+	return subprocess.run(cmd, check=True, **kw)
+
+
+# ---- the ports tree ---------------------------------------------------
+
+def read_port_yaml(path):
+	fields = {}
+	with open(path) as f:
+		for n, line in enumerate(f, 1):
+			line = line.split("#", 1)[0].strip()
+			if not line:
+				continue
+			m = re.match(r"^([a-z]+):\s*(\S.*)$", line)
+			if not m or m.group(1) not in PORT_KEYS:
+				die("%s:%d: expected one of %s" % (path, n,
+					", ".join(sorted(PORT_KEYS))))
+			fields[m.group(1)] = m.group(2).strip().strip('"')
+	if ("git" in fields) == ("debian" in fields):
+		die("%s: set either git+commit or debian+version" % path)
+	if "git" in fields and "commit" not in fields:
+		die("%s: git needs commit" % path)
+	if "debian" in fields and "version" not in fields:
+		die("%s: debian needs version" % path)
+	return fields
+
+
+def control_paragraphs(path):
+	paras, cur, key = [], {}, None
+	with open(path) as f:
+		for line in f:
+			if line.startswith("#"):
+				continue
+			if not line.strip():
+				if cur:
+					paras.append(cur)
+				cur, key = {}, None
+				continue
+			if line[0] in " \t" and key:
+				cur[key] += " " + line.strip()
+				continue
+			key, _, value = line.partition(":")
+			key = key.strip()
+			cur[key] = value.strip()
+	if cur:
+		paras.append(cur)
+	return paras
+
+
+def dep_names(field):
+	names = []
+	for alt in re.split(r"[,|]", field or ""):
+		alt = re.sub(r"\(.*?\)|\[.*?\]|<.*?>", "", alt).strip()
+		if alt and not alt.startswith("$"):
+			names.append(alt.split(":")[0])
+	return names
+
+
+class Port:
+	def __init__(self, path):
+		self.path = path
+		self.name = os.path.basename(path)
+		self.debian = os.path.join(path, "debian")
+		self.fields = read_port_yaml(os.path.join(path, "port.yaml"))
+		if self.kind == "git":
+			paras = control_paragraphs(os.path.join(self.debian, "control"))
+			self.source = paras[0]["Source"]
+			self.build_depends = dep_names(paras[0].get("Build-Depends", ""))
+			self.binaries = [p["Package"] for p in paras[1:] if "Package" in p]
+		else:
+			# Patched Debian package: Debian's debian/ is used as is.
+			self.source = self.fields["debian"]
+			self.build_depends, self.binaries = [], []
+		with open(os.path.join(self.debian, "changelog")) as f:
+			m = re.match(r"^\S+ \(([^)]+)\)", f.readline())
+		if not m:
+			die("%s: bad debian/changelog" % self.name)
+		self.version = m.group(1)
+		up = self.version.split(":", 1)[-1]
+		self.upstream = up.rsplit("-", 1)[0] if "-" in up else up
+
+	@property
+	def kind(self):
+		return "git" if "git" in self.fields else "debian"
+
+
+def find_ports(tree):
+	ports = {}
+	root = os.path.join(tree, "ports")
+	for dirpath, dirnames, filenames in os.walk(root):
+		if "port.yaml" in filenames:
+			p = Port(dirpath)
+			if p.name in ports:
+				die("two ports named %s" % p.name)
+			ports[p.name] = p
+			dirnames[:] = []
+	return ports
+
+
+def select(ports, names, everything):
+	if everything:
+		return order(ports, list(ports))
+	missing = [n for n in names if n not in ports]
+	if missing:
+		die("no such port: " + ", ".join(missing))
+	return order(ports, names)
+
+
+def order(ports, names):
+	# Ports whose binaries another selected port build-depends on go first.
+	by_binary = {b: p.name for p in ports.values() for b in p.binaries}
+	done, out, active = set(), [], set()
+
+	def visit(name):
+		if name in done:
+			return
+		if name in active:
+			die("build-dependency cycle through " + name)
+		active.add(name)
+		for dep in ports[name].build_depends:
+			if dep in by_binary and by_binary[dep] in names:
+				visit(by_binary[dep])
+		active.discard(name)
+		done.add(name)
+		out.append(ports[name])
+
+	for n in sorted(names):
+		visit(n)
+	return out
+
+
+# ---- checks -----------------------------------------------------------
+
+
+
+def check_port(port):
+	errors, warnings = [], []
+	f = port.fields
+	if port.kind == "git":
+		if not f["git"].startswith("https://"):
+			errors.append("git: not an https URL: " + f["git"])
+		if not re.fullmatch(r"[0-9a-f]{40}", f["commit"]):
+			errors.append("commit: not a full sha")
+	needed = ("control", "changelog", "rules", "copyright", "source/format")
+	if port.kind == "debian":
+		needed = ("changelog",)
+	for need in needed:
+		if not os.path.exists(os.path.join(port.debian, need)):
+			errors.append("debian/%s missing" % need)
+	for dirpath, _, filenames in os.walk(port.debian):
+		for fn in filenames:
+			path = os.path.join(dirpath, fn)
+			rel = os.path.relpath(path, port.path)
+			in_patches = "/patches/" in "/" + rel
+			if fn.endswith(".sh") and not in_patches:
+				errors.append("%s: wrapper script in debian/" % rel)
+			try:
+				text = open(path, encoding="utf-8").read()
+			except (UnicodeDecodeError, OSError):
+				continue
+			if fn in ("postinst", "postrm", "preinst", "prerm") and \
+					re.search(r"setfattr|apps_attrs", text):
+				errors.append("%s: restores attributes itself; dh-vos does" % rel)
+			if fn == "rules" and port.kind == "git":
+				if re.search(r"override_dh_(shlibdeps|strip|dwz)", text):
+					errors.append("rules: overrides a step dh-vos owns")
+				if "--with vos" not in text and "--with=vos" not in text:
+					warnings.append("rules: dh is not run --with vos")
+	return errors, warnings
+
+
+# ---- the build root ---------------------------------------------------
+
+def image(suite, arch):
+	return "vitruvianporter/buildroot:%s-%s" % (suite, arch)
+
+
+DOCKERFILE = """\
+FROM docker.io/library/debian:{base}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources \\
+ && apt-get update && apt-get install -y --no-install-recommends \\
+	ca-certificates curl gpg build-essential debhelper devscripts equivs \\
+	fakeroot dpkg-dev attr git quilt
+RUN curl -fsSL {key} | gpg --dearmor -o /usr/share/keyrings/vitruvian.gpg \\
+ && echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] {repo} {suite} main" \\
+	> /etc/apt/sources.list.d/vitruvian.list
+COPY extra/ /opt/extra/
+RUN apt-get update \\
+ && if ls /opt/extra/*.deb >/dev/null 2>&1; then apt-get install -y /opt/extra/*.deb; fi \\
+ && apt-get install -y vos-dev dh-vos \\
+ && apt-get clean
+"""
+
+
+def bootstrap(args):
+	if args.suite not in SUITES:
+		die("unknown suite " + args.suite)
+	with tempfile.TemporaryDirectory() as ctx:
+		os.mkdir(os.path.join(ctx, "extra"))
+		for deb in args.extra_deb or []:
+			shutil.copy(deb, os.path.join(ctx, "extra"))
+		with open(os.path.join(ctx, "Dockerfile"), "w") as f:
+			f.write(DOCKERFILE.format(base=SUITES[args.suite], key=REPO_KEY,
+				repo=REPO, suite=args.suite))
+		run(["docker", "build", "--pull", "--platform", "linux/" + args.arch,
+			"-t", image(args.suite, args.arch), ctx])
+
+
+# ---- building ---------------------------------------------------------
+
+def fetch_git(port, work):
+	url, commit = port.fields["git"], port.fields["commit"]
+	mirror = os.path.join(CACHE, "git", hashlib.sha1(url.encode()).hexdigest())
+	if not os.path.isdir(mirror):
+		os.makedirs(os.path.dirname(mirror), exist_ok=True)
+		run(["git", "init", "-q", "--bare", mirror])
+	have = subprocess.run(["git", "-C", mirror, "cat-file", "-e",
+		commit + "^{commit}"], capture_output=True).returncode == 0
+	if not have:
+		run(["git", "-C", mirror, "fetch", "-q", "--depth", "1", url, commit])
+	prefix = "%s-%s" % (port.source, port.upstream)
+	orig = os.path.join(work, "%s_%s.orig.tar.gz" % (port.source, port.upstream))
+	with open(orig, "wb") as out:
+		archive = subprocess.Popen(["git", "-C", mirror, "archive",
+			"--prefix=" + prefix + "/", commit], stdout=subprocess.PIPE)
+		subprocess.run(["gzip", "-n"], stdin=archive.stdout, stdout=out, check=True)
+		if archive.wait() != 0:
+			die("%s: git archive failed" % port.name)
+	run(["tar", "-xzf", orig, "-C", work])
+	src = os.path.join(work, prefix)
+	shutil.copytree(port.debian, os.path.join(src, "debian"))
+	return prefix
+
+
+BUILD_SCRIPT = r"""
+set -e
+if ls /out/*.deb >/dev/null 2>&1; then
+	(cd /out && dpkg-scanpackages -m . > Packages)
+	echo "deb [trusted=yes] file:/out ./" > /etc/apt/sources.list.d/local.list
+fi
+apt-get update -qq
+cd /work
+if [ -n "$DEBIAN_SOURCE" ]; then
+	apt-get source -qq --only-source "$DEBIAN_SOURCE=$DEBIAN_VERSION"
+	SRC=$(find . -mindepth 1 -maxdepth 1 -type d ! -name port | head -1)
+	if [ -d port/patches ]; then
+		mkdir -p "$SRC/debian/patches"
+		for p in $(cat port/patches/series); do
+			cp "port/patches/$p" "$SRC/debian/patches/"
+			echo "$p" >> "$SRC/debian/patches/series"
+		done
+	fi
+	if [ -f port/rules.diff ]; then patch -d "$SRC" -p1 < port/rules.diff; fi
+	cp port/changelog.entry /tmp/entry
+	cat "$SRC/debian/changelog" >> /tmp/entry
+	cp /tmp/entry "$SRC/debian/changelog"
+else
+	SRC=$SRCDIR
+fi
+cd "$SRC"
+mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
+dpkg-buildpackage -us -uc -b
+cd ..
+cp ./*.deb /out/
+chown "$HOST_UID:$HOST_GID" /out/*.deb
+"""
+
+
+def debian_entry(port, work):
+	# Class 2: our debian/ holds only changelog (the vos revision entry),
+	# plus patches/ and rules.diff next to it.
+	os.makedirs(os.path.join(work, "port"))
+	if os.path.isdir(os.path.join(port.path, "patches")):
+		shutil.copytree(os.path.join(port.path, "patches"),
+			os.path.join(work, "port", "patches"))
+	if os.path.exists(os.path.join(port.path, "rules.diff")):
+		shutil.copy(os.path.join(port.path, "rules.diff"),
+			os.path.join(work, "port"))
+	text = open(os.path.join(port.debian, "changelog")).read()
+	entry = text.split("\n -- ", 1)
+	if len(entry) != 2:
+		die("%s: debian/changelog has no entry" % port.name)
+	first = entry[0] + "\n -- " + entry[1].split("\n", 1)[0] + "\n\n"
+	open(os.path.join(work, "port", "changelog.entry"), "w").write(first)
+
+
+def build_port(port, args, out):
+	work = tempfile.mkdtemp(prefix=port.name + ".", dir=args.work)
+	env = ["-e", "HOST_UID=%d" % os.getuid(), "-e", "HOST_GID=%d" % os.getgid()]
+	if port.kind == "git":
+		env += ["-e", "SRCDIR=" + fetch_git(port, work)]
+	else:
+		debian_entry(port, work)
+		env += ["-e", "DEBIAN_SOURCE=" + port.fields["debian"],
+			"-e", "DEBIAN_VERSION=" + port.fields["version"]]
+	log = os.path.join(out, "logs", port.name + ".log")
+	with open(log, "w") as logf:
+		rc = subprocess.run(["docker", "run", "--rm",
+			"--platform", "linux/" + args.arch,
+			"-v", work + ":/work", "-v", out + ":/out"] + env +
+			[image(args.suite, args.arch), "bash", "-c", BUILD_SCRIPT],
+			stdout=logf, stderr=subprocess.STDOUT).returncode
+	if not args.keep:
+		# The container writes as root; it removes its own files.
+		subprocess.run(["docker", "run", "--rm", "-v", work + ":/work",
+			image(args.suite, args.arch), "find", "/work", "-mindepth", "1",
+			"-delete"], capture_output=True)
+		shutil.rmtree(work, ignore_errors=True)
+	return rc == 0, log
+
+
+def build(args, ports):
+	out = os.path.abspath(args.out)
+	os.makedirs(os.path.join(out, "logs"), exist_ok=True)
+	os.makedirs(args.work, exist_ok=True)
+	failed = []
+	for port in select(ports, args.ports, args.all):
+		ok, log = build_port(port, args, out)
+		print("%-24s %s" % (port.name, "ok" if ok else "FAILED  " + log))
+		if not ok:
+			failed.append(port.name)
+	if failed:
+		die("failed: " + ", ".join(failed))
+
+
+# ---- command line -----------------------------------------------------
+
+def main():
+	ap = argparse.ArgumentParser(prog="vitruvianporter",
+		description="Build V\\OS port packages.")
+	ap.add_argument("-C", dest="tree", default=os.environ.get(
+		"VITRUVIANPORTS", "."), help="ports tree (default: . or $VITRUVIANPORTS)")
+	ap.add_argument("--suite", default="testing-nightly")
+	ap.add_argument("--arch", default="amd64")
+	sub = ap.add_subparsers(dest="cmd", required=True)
+
+	b = sub.add_parser("bootstrap", help="create the build root image")
+	b.add_argument("--extra-deb", action="append", metavar="DEB",
+		help="install this .deb too (e.g. an unpublished dh-vos)")
+
+	for name, helptext in (("build", "build ports"), ("check", "lint ports")):
+		p = sub.add_parser(name, help=helptext)
+		p.add_argument("ports", nargs="*")
+		p.add_argument("--all", action="store_true")
+		if name == "build":
+			p.add_argument("--out", default="out")
+			p.add_argument("--work", default=os.path.join(CACHE, "work"))
+			p.add_argument("--keep", action="store_true",
+				help="keep the work tree")
+
+	sub.add_parser("list", help="list ports in build order")
+	args = ap.parse_args()
+
+	if args.cmd == "bootstrap":
+		return bootstrap(args)
+	ports = find_ports(args.tree)
+	if args.cmd == "list":
+		for p in order(ports, list(ports)):
+			print("%-24s %-7s %s" % (p.name, p.kind, p.version))
+	elif args.cmd == "check":
+		bad = 0
+		for p in select(ports, args.ports, args.all):
+			errors, warnings = check_port(p)
+			for w in warnings:
+				print("%s: warning: %s" % (p.name, w))
+			for e in errors:
+				print("%s: error: %s" % (p.name, e))
+			bad += bool(errors)
+		if bad:
+			die("%d port(s) failed the check" % bad)
+	elif args.cmd == "build":
+		if not args.ports and not args.all:
+			die("name ports or pass --all")
+		build(args, ports)
+
+
+if __name__ == "__main__":
+	main()
