@@ -24,6 +24,10 @@ CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME",
 	os.path.expanduser("~/.cache")), "vitruvianporter")
 
 
+class PortError(Exception):
+	pass
+
+
 def die(msg):
 	print("vitruvianporter: " + msg, file=sys.stderr)
 	sys.exit(1)
@@ -45,15 +49,15 @@ def read_port_yaml(path):
 				continue
 			m = re.match(r"^([a-z]+):\s*(\S.*)$", line)
 			if not m or m.group(1) not in PORT_KEYS:
-				die("%s:%d: expected one of %s" % (path, n,
+				raise PortError("%s:%d: expected one of %s" % (path, n,
 					", ".join(sorted(PORT_KEYS))))
 			fields[m.group(1)] = m.group(2).strip().strip('"')
 	if ("git" in fields) == ("debian" in fields):
-		die("%s: set either git+commit or debian+version" % path)
+		raise PortError("%s: set either git+commit or debian+version" % path)
 	if "git" in fields and "commit" not in fields:
-		die("%s: git needs commit" % path)
+		raise PortError("%s: git needs commit" % path)
 	if "debian" in fields and "version" not in fields:
-		die("%s: debian needs version" % path)
+		raise PortError("%s: debian needs version" % path)
 	return fields
 
 
@@ -106,7 +110,7 @@ class Port:
 		with open(os.path.join(self.debian, "changelog")) as f:
 			m = re.match(r"^\S+ \(([^)]+)\)", f.readline())
 		if not m:
-			die("%s: bad debian/changelog" % self.name)
+			raise PortError("bad debian/changelog")
 		self.version = m.group(1)
 		up = self.version.split(":", 1)[-1]
 		self.upstream = up.rsplit("-", 1)[0] if "-" in up else up
@@ -117,16 +121,20 @@ class Port:
 
 
 def find_ports(tree):
-	ports = {}
+	ports, broken = {}, {}
 	root = os.path.join(tree, "ports")
 	for dirpath, dirnames, filenames in os.walk(root):
-		if "port.yaml" in filenames:
-			p = Port(dirpath)
-			if p.name in ports:
-				die("two ports named %s" % p.name)
-			ports[p.name] = p
-			dirnames[:] = []
-	return ports
+		if "port.yaml" not in filenames:
+			continue
+		dirnames[:] = []
+		name = os.path.basename(dirpath)
+		if name in ports or name in broken:
+			die("two ports named %s" % name)
+		try:
+			ports[name] = Port(dirpath)
+		except (PortError, OSError, KeyError, IndexError) as e:
+			broken[name] = str(e)
+	return ports, broken
 
 
 def select(ports, names, everything):
@@ -386,7 +394,9 @@ def main():
 
 	if args.cmd == "bootstrap":
 		return bootstrap(args)
-	ports = find_ports(args.tree)
+	ports, broken = find_ports(args.tree)
+	for name, why in sorted(broken.items()):
+		print("%s: error: unreadable port: %s" % (name, why), file=sys.stderr)
 	if args.cmd == "list":
 		for p in order(ports, list(ports)):
 			print("%-24s %-7s %s" % (p.name, p.kind, p.version))
@@ -399,6 +409,7 @@ def main():
 			for e in errors:
 				print("%s: error: %s" % (p.name, e))
 			bad += bool(errors)
+		bad += len([n for n in broken if args.all or n in args.ports])
 		if bad:
 			die("%d port(s) failed the check" % bad)
 	elif args.cmd == "build":
