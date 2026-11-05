@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026, Dario Casalinuovo. All rights reserved.
+# Distributed under the terms of the GNU Lesser General Public License,
+# version 3 or later. See COPYING.LESSER.
 """Builds V\\OS port packages in a clean V\\OS build root."""
 
 import argparse
