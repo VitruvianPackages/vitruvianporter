@@ -3,39 +3,160 @@
 Builds V\OS packages from a [vitruvianports](https://github.com/VitruvianOS/vitruvianports)
 tree. Every build runs in a fresh container of the V\OS build root: the
 Debian base V\OS ships on, plus `vos-dev` and `dh-vos` from the V\OS apt
-repository.
+repository (`https://repo.v-os.dev`).
 
 ## Requirements
 
-Python 3, git and Docker (the user must be able to run `docker`).
+- Python 3.7 or later (standard library only)
+- git
+- Docker, usable by the current user (`docker run` without sudo)
+- Network access to Debian and the V\OS apt repository
 
-## Use
+## Install
+
+The tool is a single script. Put it on your `PATH`:
+
+```
+install -m 755 vitruvianporter ~/.local/bin/
+```
+
+or run it in place as `./vitruvianporter/vitruvianporter`.
+
+## Usage
+
+```
+vitruvianporter [-C TREE] [--suite SUITE] [--arch ARCH] COMMAND ...
+```
+
+Global options, given before the command:
+
+| Option | Meaning |
+|---|---|
+| `-C TREE` | ports tree (default: `$VITRUVIANPORTS`, else the current directory) |
+| `--suite SUITE` | V\OS suite, see below (default `testing-nightly`) |
+| `--arch ARCH` | architecture, e.g. `amd64` or `arm64` (default `amd64`); the container runs as `linux/ARCH` |
+
+Commands:
+
+```
+vitruvianporter bootstrap [--extra-deb DEB]...
+vitruvianporter list
+vitruvianporter check [--all] [PORT...]
+vitruvianporter build [--all] [--out DIR] [--work DIR] [--keep] [PORT...]
+```
+
+- `bootstrap` builds the build root image for the chosen suite and
+  architecture. `--extra-deb` (repeatable) installs a local `.deb` into
+  it, for trying an unpublished `vos-dev` or `dh-vos`.
+- `list` prints every port in the tree in build order, with its kind
+  (`git` or `debian`) and version.
+- `check` lints the named ports, or all of them with `--all`. It exits
+  non-zero if any port has an error. Warnings do not fail it.
+- `build` builds the named ports, or all with `--all`. Packages go to
+  `--out` (default `./out`), logs to `--out/logs/<port>.log`. `--work`
+  is the scratch directory (default `~/.cache/vitruvianporter/work`);
+  `--keep` leaves each port's work tree in place.
 
 ```
 cd vitruvianports
-vitruvianporter bootstrap                 # build root for testing-nightly/amd64
-vitruvianporter list                      # ports, in build order
-vitruvianporter check --all               # packaging rules
-vitruvianporter build takenotes xcalc     # .debs and logs in ./out
-vitruvianporter build --all --out /srv/incoming
+vitruvianporter bootstrap
+vitruvianporter check --all
+vitruvianporter build takenotes xcalc
+vitruvianporter --suite testing build --all --out /srv/incoming
 ```
 
-`--suite` picks the V\OS suite (`testing-nightly`, `testing`,
-`trixie-nightly`, `trixie`) and `--arch` the architecture. `-C <tree>` or
-`$VITRUVIANPORTS` points at the ports tree.
+## Suites and build root images
 
-`bootstrap --extra-deb <file>` installs a local package into the build
-root, for testing changes to `vos-dev` or `dh-vos` before they are
-published.
+| Suite | Debian base |
+|---|---|
+| `trixie` | trixie |
+| `trixie-nightly` | trixie |
+| `testing` | testing |
+| `testing-nightly` | testing |
+
+The suite selects both the Debian base image and the V\OS apt suite
+installed into the build root. `bootstrap` creates the Docker image
+`vitruvianporter/buildroot:<suite>-<arch>`; `build` uses the image
+matching `--suite` and `--arch`, so bootstrap each combination you
+build for. The image contains Debian's build tools, `vos-dev` and
+`dh-vos`, with `/usr/lib/vos/buildtools` first on `PATH`.
+
+## Port layout
+
+A port is a directory under `ports/` that holds a `port.yaml`. The
+directory name is the port name and must be unique in the tree.
+Directories below `ports/` are free to group ports (`apps`, `toolkits`,
+...).
+
+`port.yaml` takes `key: value` lines (`#` starts a comment). It uses
+one of two forms.
+
+Upstream source from git (`git` and `commit` required):
+
+| Key | Meaning |
+|---|---|
+| `git` | `https://` URL of the upstream repository |
+| `commit` | full 40-character commit sha |
+| `subdir` | optional; package only this directory of the repository |
+
+```
+ports/<name>/
+  port.yaml
+  debian/        control, changelog, rules, copyright, source/format, ...
+```
+
+The orig tarball is `git archive` of the pinned commit (of
+`commit:subdir` if set), and the port's `debian/` is added to it. Source
+name and upstream version come from `debian/control` and
+`debian/changelog`. Upstream patches live in `debian/patches/`
+(quilt).
+
+A patched Debian package (`debian` and `version` required):
+
+| Key | Meaning |
+|---|---|
+| `debian` | Debian source package name |
+| `version` | exact Debian version to fetch with `apt-get source` |
+
+```
+ports/<name>/
+  port.yaml
+  debian/changelog    one entry, the V\OS revision of the package
+  patches/            patch files and a `series` file listing them in order
+  rules.diff          optional, applied with `patch -p1` to the source tree
+```
+
+Debian's own `debian/` is used, with the port's patches added to
+`debian/patches/series` and the changelog entry placed on top.
 
 ## What a build does
 
-1. Fetches the pinned upstream commit, makes the orig tarball with
-   `git archive`, and adds the port's `debian/`. A patched Debian package
-   is fetched with `apt-get source` and gets the port's patches on top.
-2. Installs the build dependencies, including packages built earlier in
-   the same run, and runs `dpkg-buildpackage -b`.
+1. Fetches the pinned upstream commit into a local cache and makes the
+   orig tarball (git ports), or runs `apt-get source` (Debian ports).
+2. In the container: builds a local apt repository from `.deb` files
+   already in `--out`, so packages built earlier in the same run satisfy
+   build dependencies; installs build dependencies with `mk-build-deps`;
+   runs `dpkg-buildpackage -us -uc -b`.
 3. Copies the `.deb` files to `--out` and the log to `--out/logs`.
 
-Ports are built in dependency order. A failed port does not stop the
-others; the exit status reports it.
+Ports are built in dependency order: a port whose build dependencies
+name binary packages of another selected port is built after it. A
+failed port does not stop the others; the exit status reports it.
+
+## check
+
+`check` verifies, per port:
+
+- `port.yaml` is well formed and has a consistent key set
+- git ports: `https://` URL, full commit sha, relative `subdir`
+- required files exist (`control`, `changelog`, `rules`, `copyright`,
+  `source/format`; Debian ports need only `changelog`)
+- no wrapper scripts in `debian/` (outside `patches/`)
+- no maintainer scripts restoring attributes (`dh-vos` does that)
+- `rules` does not override `dh_shlibdeps`, `dh_strip` or `dh_dwz`
+
+Warning: `rules` not running `dh` with `--with vos`.
+
+## License
+
+LGPL-3.0-or-later. See `COPYING.LESSER` and `COPYING`.
