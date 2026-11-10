@@ -21,6 +21,8 @@ SUITES = {
 	"testing": "testing",
 	"testing-nightly": "testing",
 }
+TOOLS = ("ca-certificates curl gpg build-essential debhelper devscripts equivs "
+	"fakeroot dpkg-dev attr git quilt")
 PORT_KEYS = {"git", "commit", "subdir", "debian", "version"}
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME",
 	os.path.expanduser("~/.cache")), "vitruvianporter")
@@ -225,8 +227,7 @@ FROM docker.io/library/debian:{base}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources \\
  && apt-get update && apt-get install -y --no-install-recommends \\
-	ca-certificates curl gpg build-essential debhelper devscripts equivs \\
-	fakeroot dpkg-dev attr git quilt
+	{tools}
 RUN curl -fsSL {key} | gpg --dearmor -o /usr/share/keyrings/vitruvian.gpg \\
  && echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] {repo} {suite} main" \\
 	> /etc/apt/sources.list.d/vitruvian.list
@@ -239,16 +240,65 @@ ENV PATH=/usr/lib/vos/buildtools:$PATH
 """
 
 
+# Native mode: this machine is the build root, for a throwaway VM that
+# already runs the suite's Debian base.
+NATIVE_SETUP = r"""
+set -e
+export DEBIAN_FRONTEND=noninteractive
+S=/etc/apt/sources.list.d/debian.sources
+if [ -f $S ]; then sed -i 's/^Types: deb$/Types: deb deb-src/' $S; fi
+apt-get update
+apt-get install -y --no-install-recommends $TOOLS
+curl -fsSL "$REPO_KEY" | gpg --dearmor --yes -o /usr/share/keyrings/vitruvian.gpg
+echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] $REPO $SUITE main" \
+	> /etc/apt/sources.list.d/vitruvian.list
+apt-get update
+if [ -n "$EXTRA" ]; then apt-get install -y $EXTRA; fi
+apt-get install -y vos-dev dh-vos
+apt-get clean
+"""
+
+
+def check_native(args):
+	if os.geteuid() != 0:
+		die("--native installs packages: run it as root")
+	arch = subprocess.run(["dpkg", "--print-architecture"], capture_output=True,
+		text=True).stdout.strip()
+	if arch != args.arch:
+		die("--native: this machine is %s, not %s" % (arch, args.arch))
+	codename = ""
+	with open("/etc/os-release") as f:
+		for line in f:
+			if line.startswith("VERSION_CODENAME="):
+				codename = line.split("=", 1)[1].strip().strip('"')
+	if (codename == "trixie") != (SUITES[args.suite] == "trixie"):
+		die("--native: this machine runs %s, suite %s needs %s" % (
+			codename or "an unknown base", args.suite, SUITES[args.suite]))
+
+
+def native_env(**extra):
+	env = dict(os.environ)
+	env.update(extra)
+	env["PATH"] = "/usr/lib/vos/buildtools:" + env.get("PATH", "")
+	return env
+
+
 def bootstrap(args):
 	if args.suite not in SUITES:
 		die("unknown suite " + args.suite)
+	if args.native:
+		check_native(args)
+		extra = " ".join(os.path.abspath(d) for d in args.extra_deb or [])
+		run(["bash", "-c", NATIVE_SETUP], env=native_env(TOOLS=TOOLS,
+			REPO=REPO, REPO_KEY=REPO_KEY, SUITE=args.suite, EXTRA=extra))
+		return
 	with tempfile.TemporaryDirectory() as ctx:
 		os.mkdir(os.path.join(ctx, "extra"))
 		for deb in args.extra_deb or []:
 			shutil.copy(deb, os.path.join(ctx, "extra"))
 		with open(os.path.join(ctx, "Dockerfile"), "w") as f:
 			f.write(DOCKERFILE.format(base=SUITES[args.suite], key=REPO_KEY,
-				repo=REPO, suite=args.suite))
+				repo=REPO, suite=args.suite, tools=TOOLS))
 		run(["docker", "build", "--pull", "--platform", "linux/" + args.arch,
 			"-t", image(args.suite, args.arch), ctx])
 
@@ -284,12 +334,12 @@ def fetch_git(port, work):
 
 BUILD_SCRIPT = r"""
 set -e
-if ls /out/*.deb >/dev/null 2>&1; then
-	(cd /out && dpkg-scanpackages -m . > Packages)
-	echo "deb [trusted=yes] file:/out ./" > /etc/apt/sources.list.d/local.list
+if ls "$OUT"/*.deb >/dev/null 2>&1; then
+	(cd "$OUT" && dpkg-scanpackages -m . > Packages)
+	echo "deb [trusted=yes] file:$OUT ./" > /etc/apt/sources.list.d/local.list
 fi
 apt-get update -qq
-cd /work
+cd "$WORK"
 if [ -n "$DEBIAN_SOURCE" ]; then
 	apt-get source -qq --only-source "$DEBIAN_SOURCE=$DEBIAN_VERSION"
 	SRC=$(find . -mindepth 1 -maxdepth 1 -type d ! -name port | head -1)
@@ -311,8 +361,8 @@ cd "$SRC"
 mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
 dpkg-buildpackage -us -uc -b
 cd ..
-cp ./*.deb /out/
-chown "$HOST_UID:$HOST_GID" /out/*.deb
+cp ./*.deb "$OUT"/
+chown "$HOST_UID:$HOST_GID" "$OUT"/*.deb
 """
 
 
@@ -336,21 +386,34 @@ def debian_entry(port, work):
 
 def build_port(port, args, out):
 	work = tempfile.mkdtemp(prefix=port.name + ".", dir=args.work)
-	env = ["-e", "HOST_UID=%d" % os.getuid(), "-e", "HOST_GID=%d" % os.getgid()]
+	env = {"HOST_UID": str(os.getuid()), "HOST_GID": str(os.getgid())}
 	if port.kind == "git":
-		env += ["-e", "SRCDIR=" + fetch_git(port, work)]
+		env["SRCDIR"] = fetch_git(port, work)
 	else:
 		debian_entry(port, work)
-		env += ["-e", "DEBIAN_SOURCE=" + port.fields["debian"],
-			"-e", "DEBIAN_VERSION=" + port.fields["version"]]
+		env["DEBIAN_SOURCE"] = port.fields["debian"]
+		env["DEBIAN_VERSION"] = port.fields["version"]
 	log = os.path.join(out, "logs", port.name + ".log")
 	with open(log, "w") as logf:
-		rc = subprocess.run(["docker", "run", "--rm",
-			"--platform", "linux/" + args.arch,
-			"-v", work + ":/work", "-v", out + ":/out"] + env +
-			[image(args.suite, args.arch), "bash", "-c", BUILD_SCRIPT],
-			stdout=logf, stderr=subprocess.STDOUT).returncode
-	if not args.keep:
+		if args.native:
+			# Build dependencies stay installed between ports: the VM is
+			# the isolation.
+			rc = subprocess.run(["bash", "-c", BUILD_SCRIPT],
+				env=native_env(WORK=work, OUT=out,
+				DEBIAN_FRONTEND="noninteractive", **env),
+				stdout=logf, stderr=subprocess.STDOUT).returncode
+		else:
+			env.update(WORK="/work", OUT="/out")
+			flags = [a for k, v in sorted(env.items()) for a in ("-e", k + "=" + v)]
+			rc = subprocess.run(["docker", "run", "--rm",
+				"--platform", "linux/" + args.arch,
+				"-v", work + ":/work", "-v", out + ":/out"] + flags +
+				[image(args.suite, args.arch), "bash", "-c", BUILD_SCRIPT],
+				stdout=logf, stderr=subprocess.STDOUT).returncode
+	if args.native:
+		if not args.keep:
+			shutil.rmtree(work, ignore_errors=True)
+	elif not args.keep:
 		# The container writes as root; it removes its own files.
 		subprocess.run(["docker", "run", "--rm", "-v", work + ":/work",
 			image(args.suite, args.arch), "find", "/work", "-mindepth", "1",
@@ -382,6 +445,8 @@ def main():
 		"VITRUVIANPORTS", "."), help="ports tree (default: . or $VITRUVIANPORTS)")
 	ap.add_argument("--suite", default="testing-nightly")
 	ap.add_argument("--arch", default="amd64")
+	ap.add_argument("--native", action="store_true",
+		help="use this machine as the build root instead of Docker")
 	sub = ap.add_subparsers(dest="cmd", required=True)
 
 	b = sub.add_parser("bootstrap", help="create the build root image")
@@ -424,6 +489,8 @@ def main():
 	elif args.cmd == "build":
 		if not args.ports and not args.all:
 			die("name ports or pass --all")
+		if args.native:
+			check_native(args)
 		build(args, ports)
 
 

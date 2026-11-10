@@ -3,13 +3,15 @@
 Builds V\OS packages from a [vitruvianports](https://github.com/VitruvianOS/vitruvianports)
 tree. Every build runs in a fresh container of the V\OS build root: the
 Debian base V\OS ships on, plus `vos-dev` and `dh-vos` from the V\OS apt
-repository (`https://repo.v-os.dev`).
+repository (`https://repo.v-os.dev`). With `--native` the machine it
+runs on is the build root instead, for a throwaway VM.
 
 ## Requirements
 
 - Python 3.7 or later (standard library only)
 - git
-- Docker, usable by the current user (`docker run` without sudo)
+- Docker, usable by the current user (`docker run` without sudo), or
+  root on the build machine with `--native`
 - Network access to Debian and the V\OS apt repository
 
 ## Install
@@ -35,6 +37,7 @@ Global options, given before the command:
 | `-C TREE` | ports tree (default: `$VITRUVIANPORTS`, else the current directory) |
 | `--suite SUITE` | V\OS suite, see below (default `testing-nightly`) |
 | `--arch ARCH` | architecture, e.g. `amd64` or `arm64` (default `amd64`); the container runs as `linux/ARCH` |
+| `--native` | use this machine as the build root, without Docker (see below) |
 
 Commands:
 
@@ -80,6 +83,24 @@ installed into the build root. `bootstrap` creates the Docker image
 matching `--suite` and `--arch`, so bootstrap each combination you
 build for. The image contains Debian's build tools, `vos-dev` and
 `dh-vos`, with `/usr/lib/vos/buildtools` first on `PATH`.
+
+## Native mode
+
+`--native` runs `bootstrap` and `build` directly on the current
+machine, as root, with no Docker. It is meant for a disposable VM that
+already runs the suite's Debian base and architecture; it refuses to
+run when either does not match `--suite` and `--arch`.
+
+`bootstrap --native` installs the build tools, the V\OS repository and
+its key, `vos-dev` and `dh-vos` on the machine. `build --native` runs
+each port's build in place. Build dependencies stay installed between
+ports, so the isolation between builds is the VM, not the tool: start
+from a fresh VM for each run.
+
+```
+vitruvianporter --suite trixie --native bootstrap
+vitruvianporter -C vitruvianports --suite trixie --native build --all --out /srv/incoming
+```
 
 ## Port layout
 
