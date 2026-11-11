@@ -228,15 +228,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources \\
  && apt-get update && apt-get install -y --no-install-recommends \\
 	{tools}
-RUN curl -fsSL {key} | gpg --dearmor -o /usr/share/keyrings/vitruvian.gpg \\
- && echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] {repo} {suite} main" \\
-	> /etc/apt/sources.list.d/vitruvian.list
-COPY extra/ /opt/extra/
+{repo}COPY extra/ /opt/extra/
 RUN apt-get update \\
  && if ls /opt/extra/*.deb >/dev/null 2>&1; then apt-get install -y /opt/extra/*.deb; fi \\
  && apt-get install -y vos-dev dh-vos \\
  && apt-get clean
 ENV PATH=/usr/lib/vos/buildtools:$PATH
+"""
+
+DOCKER_REPO = """\
+RUN curl -fsSL {key} | gpg --dearmor -o /usr/share/keyrings/vitruvian.gpg \\
+ && echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] {repo} {suite} main" \\
+	> /etc/apt/sources.list.d/vitruvian.list
 """
 
 
@@ -249,10 +252,12 @@ S=/etc/apt/sources.list.d/debian.sources
 if [ -f $S ]; then sed -i 's/^Types: deb$/Types: deb deb-src/' $S; fi
 apt-get update
 apt-get install -y --no-install-recommends $TOOLS
-curl -fsSL "$REPO_KEY" | gpg --dearmor --yes -o /usr/share/keyrings/vitruvian.gpg
-echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] $REPO $SUITE main" \
-	> /etc/apt/sources.list.d/vitruvian.list
-apt-get update
+if [ -z "$NO_REPO" ]; then
+	curl -fsSL "$REPO_KEY" | gpg --dearmor --yes -o /usr/share/keyrings/vitruvian.gpg
+	echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] $REPO $SUITE main" \
+		> /etc/apt/sources.list.d/vitruvian.list
+	apt-get update
+fi
 if [ -n "$EXTRA" ]; then apt-get install -y $EXTRA; fi
 apt-get install -y vos-dev dh-vos
 apt-get clean
@@ -290,15 +295,18 @@ def bootstrap(args):
 		check_native(args, install=True)
 		extra = " ".join(os.path.abspath(d) for d in args.extra_deb or [])
 		run(["bash", "-c", NATIVE_SETUP], env=native_env(TOOLS=TOOLS,
-			REPO=REPO, REPO_KEY=REPO_KEY, SUITE=args.suite, EXTRA=extra))
+			REPO=REPO, REPO_KEY=REPO_KEY, SUITE=args.suite, EXTRA=extra,
+			NO_REPO="1" if args.no_repo else ""))
 		return
 	with tempfile.TemporaryDirectory() as ctx:
 		os.mkdir(os.path.join(ctx, "extra"))
 		for deb in args.extra_deb or []:
 			shutil.copy(deb, os.path.join(ctx, "extra"))
 		with open(os.path.join(ctx, "Dockerfile"), "w") as f:
-			f.write(DOCKERFILE.format(base=SUITES[args.suite], key=REPO_KEY,
-				repo=REPO, suite=args.suite, tools=TOOLS))
+			repo = "" if args.no_repo else DOCKER_REPO.format(key=REPO_KEY,
+				repo=REPO, suite=args.suite)
+			f.write(DOCKERFILE.format(base=SUITES[args.suite], repo=repo,
+				tools=TOOLS))
 		run(["docker", "build", "--pull", "--platform", "linux/" + args.arch,
 			"-t", image(args.suite, args.arch), ctx])
 
@@ -461,6 +469,9 @@ def main():
 	b = sub.add_parser("bootstrap", help="create the build root image")
 	b.add_argument("--extra-deb", action="append", metavar="DEB",
 		help="install this .deb too (e.g. an unpublished dh-vos)")
+	b.add_argument("--no-repo", action="store_true",
+		help="leave the V\\OS repository out; vos-dev and dh-vos "
+		"come from --extra-deb")
 
 	for name, helptext in (("build", "build ports"), ("check", "lint ports")):
 		p = sub.add_parser(name, help=helptext)

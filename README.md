@@ -43,7 +43,7 @@ Global options, given before the command:
 Commands:
 
 ```
-vitruvianporter bootstrap [--extra-deb DEB]...
+vitruvianporter bootstrap [--extra-deb DEB]... [--no-repo]
 vitruvianporter list
 vitruvianporter check [--all] [PORT...]
 vitruvianporter build [--all] [--out DIR] [--work DIR] [--keep] [PORT...]
@@ -52,6 +52,9 @@ vitruvianporter build [--all] [--out DIR] [--work DIR] [--keep] [PORT...]
 - `bootstrap` builds the build root image for the chosen suite and
   architecture. `--extra-deb` (repeatable) installs a local `.deb` into
   it, for trying an unpublished `vos-dev` or `dh-vos`.
+  `--no-repo` leaves the V\OS repository out of the build root, so
+  `vos-dev` and `dh-vos` must come from `--extra-deb`: for building
+  before they are published.
 - `list` prints every port in the tree in build order, with its kind
   (`git` or `debian`) and version.
 - `check` lints the named ports, or all of them with `--all`. It exits
