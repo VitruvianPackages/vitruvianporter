@@ -11,7 +11,8 @@ runs on is the build root instead, for a throwaway VM.
 - Python 3.7 or later (standard library only)
 - git
 - Docker, usable by the current user (`docker run` without sudo), or
-  root on the build machine with `--native`
+  `--native` on a machine that has the build dependencies (root to
+  install them)
 - Network access to Debian and the V\OS apt repository
 
 ## Install
@@ -87,15 +88,19 @@ build for. The image contains Debian's build tools, `vos-dev` and
 ## Native mode
 
 `--native` runs `bootstrap` and `build` directly on the current
-machine, as root, with no Docker. It is meant for a disposable VM that
-already runs the suite's Debian base and architecture; it refuses to
+machine, with no Docker. It is meant for a disposable VM that already
+runs the suite's Debian base and architecture; it refuses to
 run when either does not match `--suite` and `--arch`.
 
 `bootstrap --native` installs the build tools, the V\OS repository and
-its key, `vos-dev` and `dh-vos` on the machine. `build --native` runs
-each port's build in place. Build dependencies stay installed between
-ports, so the isolation between builds is the VM, not the tool: start
-from a fresh VM for each run.
+its key, `vos-dev` and `dh-vos` on the machine, so it needs root.
+`build --native` runs each port's build in place and needs root only to
+install: as root it installs each port's build dependencies and makes
+the ports built so far available to the next ones; as a normal user it
+installs nothing and stops on a port whose build dependencies are
+missing. Installed build dependencies stay between ports, so the
+isolation between builds is the VM, not the tool: start from a fresh VM
+for each run.
 
 ```
 vitruvianporter --suite trixie --native bootstrap

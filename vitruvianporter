@@ -259,9 +259,9 @@ apt-get clean
 """
 
 
-def check_native(args):
-	if os.geteuid() != 0:
-		die("--native installs packages: run it as root")
+def check_native(args, install=False):
+	if install and os.geteuid() != 0:
+		die("--native bootstrap installs packages: run it as root")
 	arch = subprocess.run(["dpkg", "--print-architecture"], capture_output=True,
 		text=True).stdout.strip()
 	if arch != args.arch:
@@ -287,7 +287,7 @@ def bootstrap(args):
 	if args.suite not in SUITES:
 		die("unknown suite " + args.suite)
 	if args.native:
-		check_native(args)
+		check_native(args, install=True)
 		extra = " ".join(os.path.abspath(d) for d in args.extra_deb or [])
 		run(["bash", "-c", NATIVE_SETUP], env=native_env(TOOLS=TOOLS,
 			REPO=REPO, REPO_KEY=REPO_KEY, SUITE=args.suite, EXTRA=extra))
@@ -334,11 +334,15 @@ def fetch_git(port, work):
 
 BUILD_SCRIPT = r"""
 set -e
-if ls "$OUT"/*.deb >/dev/null 2>&1; then
-	(cd "$OUT" && dpkg-scanpackages -m . > Packages)
-	echo "deb [trusted=yes] file:$OUT ./" > /etc/apt/sources.list.d/local.list
+# Only installing needs root: without it the build dependencies must
+# already be on the machine.
+if [ "$(id -u)" = 0 ]; then
+	if ls "$OUT"/*.deb >/dev/null 2>&1; then
+		(cd "$OUT" && dpkg-scanpackages -m . > Packages)
+		echo "deb [trusted=yes] file:$OUT ./" > /etc/apt/sources.list.d/local.list
+	fi
+	apt-get update -qq
 fi
-apt-get update -qq
 cd "$WORK"
 if [ -n "$DEBIAN_SOURCE" ]; then
 	apt-get source -qq --only-source "$DEBIAN_SOURCE=$DEBIAN_VERSION"
@@ -358,7 +362,12 @@ else
 	SRC=$SRCDIR
 fi
 cd "$SRC"
-mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
+if [ "$(id -u)" = 0 ]; then
+	mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
+elif ! dpkg-checkbuilddeps; then
+	echo "build dependencies missing: install them, or run as root" >&2
+	exit 1
+fi
 dpkg-buildpackage -us -uc -b
 cd ..
 cp ./*.deb "$OUT"/
