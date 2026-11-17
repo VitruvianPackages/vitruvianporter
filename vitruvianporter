@@ -24,7 +24,7 @@ SUITES = {
 TOOLS = ("ca-certificates curl gpg build-essential debhelper devscripts equivs "
 	"fakeroot dpkg-dev attr git quilt")
 PORT_KEYS = {"git", "commit", "subdir", "debian", "version", "version-trixie",
-	"skip-trixie"}
+	"skip-trixie", "repack", "recommends"}
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME",
 	os.path.expanduser("~/.cache")), "vitruvianporter")
 
@@ -57,12 +57,15 @@ def read_port_yaml(path):
 				raise PortError("%s:%d: expected one of %s" % (path, n,
 					", ".join(sorted(PORT_KEYS))))
 			fields[m.group(1)] = m.group(2).strip().strip('"')
-	if ("git" in fields) == ("debian" in fields):
-		raise PortError("%s: set either git+commit or debian+version" % path)
+	if sum(k in fields for k in ("git", "debian", "repack")) != 1:
+		raise PortError("%s: set one of git+commit, debian+version, repack+version"
+			% path)
 	if "git" in fields and "commit" not in fields:
 		raise PortError("%s: git needs commit" % path)
-	if "debian" in fields and "version" not in fields:
-		raise PortError("%s: debian needs version" % path)
+	if ("debian" in fields or "repack" in fields) and "version" not in fields:
+		raise PortError("%s: debian and repack need version" % path)
+	if "repack" in fields and "recommends" not in fields:
+		raise PortError("%s: repack needs recommends" % path)
 	return fields
 
 
@@ -108,6 +111,12 @@ class Port:
 			self.source = paras[0]["Source"]
 			self.build_depends = dep_names(paras[0].get("Build-Depends", ""))
 			self.binaries = [p["Package"] for p in paras[1:] if "Package" in p]
+		elif self.kind == "repack":
+			self.source = self.fields["repack"]
+			self.build_depends, self.binaries = [], [self.source]
+			self.version = self.fields["version"] + "vos1"
+			self.upstream = self.fields["version"]
+			return
 		else:
 			# Patched Debian package: Debian's debian/ is used as is.
 			self.source = self.fields["debian"]
@@ -122,7 +131,10 @@ class Port:
 
 	@property
 	def kind(self):
-		return "git" if "git" in self.fields else "debian"
+		for k in ("git", "repack"):
+			if k in self.fields:
+				return k
+		return "debian"
 
 	def skipped(self, base):
 		return self.fields.get("skip-" + base) in ("yes", "true")
@@ -199,6 +211,8 @@ def check_port(port):
 	needed = ("control", "changelog", "rules", "copyright", "source/format")
 	if port.kind == "debian":
 		needed = ("changelog",)
+	elif port.kind == "repack":
+		needed = ()
 	for need in needed:
 		if not os.path.exists(os.path.join(port.debian, need)):
 			errors.append("debian/%s missing" % need)
@@ -391,6 +405,25 @@ chown "$HOST_UID:$HOST_GID" "$OUT"/*.deb
 """
 
 
+# A leaf binary package of Debian, unchanged but for one more Recommends.
+REPACK_SCRIPT = r"""
+set -e
+if [ "$(id -u)" = 0 ]; then apt-get update -qq; fi
+cd "$WORK"
+apt-get download -qq "$REPACK_PKG=$REPACK_VERSION"
+dpkg-deb -R ./*.deb pkg
+C=pkg/DEBIAN/control
+sed -i "s/^Version: .*/Version: ${REPACK_VERSION}vos1/" $C
+if grep -q '^Recommends:' $C; then
+	sed -i "s/^Recommends: .*/&, $REPACK_RECOMMENDS/" $C
+else
+	sed -i "0,/^Description:/s//Recommends: $REPACK_RECOMMENDS\nDescription:/" $C
+fi
+dpkg-deb --root-owner-group -b pkg "$OUT/"
+chown "$HOST_UID:$HOST_GID" "$OUT"/*.deb
+"""
+
+
 def debian_entry(port, work, version):
 	# Class 2: our debian/ holds only changelog (the vos revision entry),
 	# plus patches/ and rules.diff next to it.
@@ -418,8 +451,14 @@ def debian_entry(port, work, version):
 def build_port(port, args, out):
 	work = tempfile.mkdtemp(prefix=port.name + ".", dir=args.work)
 	env = {"HOST_UID": str(os.getuid()), "HOST_GID": str(os.getgid())}
+	script = BUILD_SCRIPT
 	if port.kind == "git":
 		env["SRCDIR"] = fetch_git(port, work)
+	elif port.kind == "repack":
+		script = REPACK_SCRIPT
+		env["REPACK_PKG"] = port.source
+		env["REPACK_VERSION"] = port.debian_version(SUITES[args.suite])
+		env["REPACK_RECOMMENDS"] = port.fields["recommends"]
 	else:
 		version = port.debian_version(SUITES[args.suite])
 		debian_entry(port, work, version)
@@ -430,7 +469,7 @@ def build_port(port, args, out):
 		if args.native:
 			# Build dependencies stay installed between ports: the VM is
 			# the isolation.
-			rc = subprocess.run(["bash", "-c", BUILD_SCRIPT],
+			rc = subprocess.run(["bash", "-c", script],
 				env=native_env(WORK=work, OUT=out,
 				DEBIAN_FRONTEND="noninteractive", **env),
 				stdout=logf, stderr=subprocess.STDOUT).returncode
@@ -440,7 +479,7 @@ def build_port(port, args, out):
 			rc = subprocess.run(["docker", "run", "--rm",
 				"--platform", "linux/" + args.arch,
 				"-v", work + ":/work", "-v", out + ":/out"] + flags +
-				[image(args.suite, args.arch), "bash", "-c", BUILD_SCRIPT],
+				[image(args.suite, args.arch), "bash", "-c", script],
 				stdout=logf, stderr=subprocess.STDOUT).returncode
 	if args.native:
 		if not args.keep:
