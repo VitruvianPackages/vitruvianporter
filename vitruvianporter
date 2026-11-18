@@ -393,7 +393,7 @@ else
 fi
 cd "$SRC"
 if [ "$(id -u)" = 0 ]; then
-	mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
+	mk-build-deps -i -r -t 'apt-get -y --no-install-recommends --allow-downgrades' debian/control
 elif ! dpkg-checkbuilddeps; then
 	echo "build dependencies missing: install them, or run as root" >&2
 	exit 1
