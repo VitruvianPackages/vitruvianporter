@@ -427,6 +427,21 @@ chown "$HOST_UID:$HOST_GID" "$OUT"/*.deb
 """
 
 
+def revision(port, floor):
+	# The vosN revision is the number of commits that touched the port, so any
+	# change to a port gets a version apt upgrades to; the changelog value is the
+	# floor. A shallow clone cannot count them: the floor is used then.
+	def git(*args):
+		return subprocess.run(["git", "-C", port.path] + list(args),
+			capture_output=True, text=True).stdout.strip()
+	try:
+		if git("rev-parse", "--is-shallow-repository") != "false":
+			return floor
+		return max(floor, int(git("rev-list", "--count", "HEAD", "--", ".")))
+	except (OSError, ValueError):
+		return floor
+
+
 def debian_entry(port, work, version):
 	# Class 2: our debian/ holds only changelog (the vos revision entry),
 	# plus patches/ and rules.diff next to it.
@@ -442,11 +457,12 @@ def debian_entry(port, work, version):
 	if len(entry) != 2:
 		die("%s: debian/changelog has no entry" % port.name)
 	# The entry is ours; its version follows the source that is built.
-	m = re.match(r"^(\S+) \(\S*?(?:vos(\d+))?\)(.*)", entry[0], re.S)
+	# "+vosN" keeps the revision above a Debian binNMU (1.2-3+b1 < 1.2-3+vos1).
+	m = re.match(r"^(\S+) \(\S*?(\+?)(?:vos(\d+))?\)(.*)", entry[0], re.S)
 	if not m:
 		die("%s: bad debian/changelog entry" % port.name)
-	entry[0] = "%s (%svos%s)%s" % (m.group(1), version, m.group(2) or "1",
-		m.group(3))
+	entry[0] = "%s (%s%svos%d)%s" % (m.group(1), version, m.group(2),
+		revision(port, int(m.group(3) or 1)), m.group(4))
 	first = entry[0] + "\n -- " + entry[1].split("\n", 1)[0] + "\n\n"
 	open(os.path.join(work, "port", "changelog.entry"), "w").write(first)
 
