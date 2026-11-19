@@ -144,6 +144,13 @@ class Port:
 		return self.fields.get("version-" + base, self.fields["version"])
 
 
+def lane(suite):
+	# The repo pool is shared by the suites and a package file is named by its
+	# version: the same version built on two Debian bases is two different
+	# files. The trixie lane marks its own, above the unmarked ones.
+	return "+deb13" if SUITES[suite] == "trixie" else ""
+
+
 def find_ports(tree):
 	ports, broken = {}, {}
 	root = os.path.join(tree, "ports")
@@ -338,7 +345,7 @@ def bootstrap(args):
 
 # ---- building ---------------------------------------------------------
 
-def fetch_git(port, work):
+def fetch_git(port, work, suffix):
 	url, commit = port.fields["git"], port.fields["commit"]
 	mirror = os.path.join(CACHE, "git", hashlib.sha1(url.encode()).hexdigest())
 	if not os.path.isdir(mirror):
@@ -362,6 +369,11 @@ def fetch_git(port, work):
 	run(["tar", "-xzf", orig, "-C", work])
 	src = os.path.join(work, prefix)
 	shutil.copytree(port.debian, os.path.join(src, "debian"))
+	if suffix:
+		log = os.path.join(src, "debian", "changelog")
+		text = open(log).read()
+		open(log, "w").write(re.sub(r"^(\S+ \([^)]+)\)", r"\1%s)" % suffix,
+			text, count=1))
 	return prefix
 
 
@@ -416,7 +428,7 @@ cd "$WORK"
 apt-get download -qq "$REPACK_PKG=$REPACK_VERSION"
 dpkg-deb -R ./*.deb pkg
 C=pkg/DEBIAN/control
-sed -i "s/^Version: .*/Version: ${REPACK_VERSION}vos1/" $C
+sed -i "s/^Version: .*/Version: ${REPACK_VERSION}vos1${REPACK_LANE}/" $C
 if grep -q '^Recommends:' $C; then
 	sed -i "s/^Recommends: .*/&, $REPACK_RECOMMENDS/" $C
 else
@@ -442,7 +454,7 @@ def revision(port, floor):
 		return floor
 
 
-def debian_entry(port, work, version):
+def debian_entry(port, work, version, suffix):
 	# Class 2: our debian/ holds only changelog (the vos revision entry),
 	# plus patches/ and rules.diff next to it.
 	os.makedirs(os.path.join(work, "port"))
@@ -461,8 +473,8 @@ def debian_entry(port, work, version):
 	m = re.match(r"^(\S+) \(\S*?(\+?)(?:vos(\d+))?\)(.*)", entry[0], re.S)
 	if not m:
 		die("%s: bad debian/changelog entry" % port.name)
-	entry[0] = "%s (%s%svos%d)%s" % (m.group(1), version, m.group(2),
-		revision(port, int(m.group(3) or 1)), m.group(4))
+	entry[0] = "%s (%s%svos%d%s)%s" % (m.group(1), version, m.group(2),
+		revision(port, int(m.group(3) or 1)), suffix, m.group(4))
 	first = entry[0] + "\n -- " + entry[1].split("\n", 1)[0] + "\n\n"
 	open(os.path.join(work, "port", "changelog.entry"), "w").write(first)
 
@@ -472,15 +484,16 @@ def build_port(port, args, out):
 	env = {"HOST_UID": str(os.getuid()), "HOST_GID": str(os.getgid())}
 	script = BUILD_SCRIPT
 	if port.kind == "git":
-		env["SRCDIR"] = fetch_git(port, work)
+		env["SRCDIR"] = fetch_git(port, work, lane(args.suite))
 	elif port.kind == "repack":
 		script = REPACK_SCRIPT
 		env["REPACK_PKG"] = port.source
 		env["REPACK_VERSION"] = port.debian_version(SUITES[args.suite])
 		env["REPACK_RECOMMENDS"] = port.fields["recommends"]
+		env["REPACK_LANE"] = lane(args.suite)
 	else:
 		version = port.debian_version(SUITES[args.suite])
-		debian_entry(port, work, version)
+		debian_entry(port, work, version, lane(args.suite))
 		env["DEBIAN_SOURCE"] = port.fields["debian"]
 		env["DEBIAN_VERSION"] = version
 	log = os.path.join(out, "logs", port.name + ".log")
