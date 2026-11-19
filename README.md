@@ -77,7 +77,7 @@ vitruvianporter --suite testing build --all --out /srv/incoming
 | Suite | Debian base |
 |---|---|
 | `trixie` | trixie |
-| `trixie-nightly` | trixie |
+| `stable-nightly` | trixie |
 | `testing` | testing |
 | `testing-nightly` | testing |
 

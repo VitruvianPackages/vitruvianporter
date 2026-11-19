@@ -17,6 +17,7 @@ REPO = "https://repo.v-os.dev"
 REPO_KEY = REPO + "/repo-key.asc"
 SUITES = {
 	"trixie": "trixie",
+	"stable-nightly": "trixie",
 	"trixie-nightly": "trixie",
 	"testing": "testing",
 	"testing-nightly": "testing",
