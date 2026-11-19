@@ -254,6 +254,7 @@ RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.s
 RUN apt-get update \\
  && if ls /opt/extra/*.deb >/dev/null 2>&1; then apt-get install -y /opt/extra/*.deb; fi \\
  && apt-get install -y vos-dev dh-vos \\
+ && if [ -f /etc/apt/sources.list.d/vitruvian.sources ]; then rm -f /etc/apt/sources.list.d/vitruvian.list; fi \\
  && apt-get clean
 ENV PATH=/usr/lib/vos/buildtools:$PATH
 """
@@ -282,6 +283,8 @@ if [ -z "$NO_REPO" ]; then
 fi
 if [ -n "$EXTRA" ]; then apt-get install -y $EXTRA; fi
 apt-get install -y vos-dev dh-vos
+# vos-dev brings its own vitruvian.sources; two entries for the repo conflict on Signed-By
+if [ -f /etc/apt/sources.list.d/vitruvian.sources ]; then rm -f /etc/apt/sources.list.d/vitruvian.list; fi
 apt-get clean
 """
 
