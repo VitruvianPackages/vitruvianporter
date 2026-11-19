@@ -369,6 +369,10 @@ def fetch_git(port, work, suffix):
 	run(["tar", "-xzf", orig, "-C", work])
 	src = os.path.join(work, prefix)
 	shutil.copytree(port.debian, os.path.join(src, "debian"))
+	# A port with history gets +vosN so a patch change upgrades; the orig
+	# tarball keeps the upstream version.
+	rev = revision(port, 1)
+	suffix = ("+vos%d" % rev if rev > 1 else "") + suffix
 	if suffix:
 		log = os.path.join(src, "debian", "changelog")
 		text = open(log).read()
