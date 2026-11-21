@@ -447,16 +447,22 @@ chown "$HOST_UID:$HOST_GID" "$OUT"/*.deb
 def revision(port, floor):
 	# The vosN revision is the number of commits that touched the port, so any
 	# change to a port gets a version apt upgrades to; the changelog value is the
-	# floor. A shallow clone cannot count them: the floor is used then.
+	# floor. Builds run as root in chroots over a tree owned by the builder, so
+	# git is told the tree is safe; an uncountable tree is fatal, a silent floor
+	# gives every arch and suite a different version for the same port.
 	def git(*args):
-		return subprocess.run(["git", "-C", port.path] + list(args),
-			capture_output=True, text=True).stdout.strip()
-	try:
-		if git("rev-parse", "--is-shallow-repository") != "false":
-			return floor
-		return max(floor, int(git("rev-list", "--count", "HEAD", "--", ".")))
-	except (OSError, ValueError):
+		r = subprocess.run(["git", "-c", "safe.directory=*", "-C", port.path]
+			+ list(args), capture_output=True, text=True)
+		if r.returncode:
+			die("%s: git %s: %s" % (port.name, args[0], r.stderr.strip()))
+		return r.stdout.strip()
+	if not os.path.isdir(os.path.join(port.path, ".git")) and \
+			subprocess.run(["git", "-c", "safe.directory=*", "-C", port.path,
+				"rev-parse"], capture_output=True).returncode:
 		return floor
+	if git("rev-parse", "--is-shallow-repository") != "false":
+		die("%s: shallow clone, the vos revision cannot be counted" % port.name)
+	return max(floor, int(git("rev-list", "--count", "HEAD", "--", ".")))
 
 
 def debian_entry(port, work, version, suffix):
