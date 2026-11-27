@@ -284,9 +284,16 @@ if [ -f $S ]; then sed -i 's/^Types: deb$/Types: deb deb-src/' $S; fi
 apt-get update
 apt-get install -y --no-install-recommends $TOOLS
 if [ -z "$NO_REPO" ]; then
-	curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 120 "$REPO_KEY" | gpg --dearmor --yes -o /usr/share/keyrings/vitruvian.gpg
-	echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] $REPO $SUITE main" \
-		> /etc/apt/sources.list.d/vitruvian.list
+	V=/etc/apt/sources.list.d/vitruvian.sources
+	if [ -f $V ]; then
+		# a V\OS host already has the repo with its own key: point it at our suite instead
+		# of adding a second entry, which apt refuses (Signed-By conflict)
+		sed -i "s|^Suites:.*|Suites: $SUITE|" $V
+	else
+		curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 120 "$REPO_KEY" | gpg --dearmor --yes -o /usr/share/keyrings/vitruvian.gpg
+		echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] $REPO $SUITE main" \
+			> /etc/apt/sources.list.d/vitruvian.list
+	fi
 	apt-get update
 fi
 if [ -n "$EXTRA" ]; then apt-get install -y $EXTRA; fi
