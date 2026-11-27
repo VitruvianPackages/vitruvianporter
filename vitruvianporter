@@ -268,7 +268,7 @@ ENV PATH=/usr/lib/vos/buildtools:$PATH
 """
 
 DOCKER_REPO = """\
-RUN curl -fsSL {key} | gpg --dearmor -o /usr/share/keyrings/vitruvian.gpg \\
+RUN curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 120 {key} | gpg --dearmor -o /usr/share/keyrings/vitruvian.gpg \\
  && echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] {repo} {suite} main" \\
 	> /etc/apt/sources.list.d/vitruvian.list
 """
@@ -284,7 +284,7 @@ if [ -f $S ]; then sed -i 's/^Types: deb$/Types: deb deb-src/' $S; fi
 apt-get update
 apt-get install -y --no-install-recommends $TOOLS
 if [ -z "$NO_REPO" ]; then
-	curl -fsSL "$REPO_KEY" | gpg --dearmor --yes -o /usr/share/keyrings/vitruvian.gpg
+	curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 120 "$REPO_KEY" | gpg --dearmor --yes -o /usr/share/keyrings/vitruvian.gpg
 	echo "deb [signed-by=/usr/share/keyrings/vitruvian.gpg] $REPO $SUITE main" \
 		> /etc/apt/sources.list.d/vitruvian.list
 	apt-get update
